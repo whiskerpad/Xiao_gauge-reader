@@ -1,0 +1,36 @@
+{
+ "config": {
+  "cx": 326.0,
+  "cy": 224.1,
+  "ri": 100.0,
+  "ro": 112.0,
+  "a0": 229.0,
+  "a1": 136.9,
+  "vmin": 0.0,
+  "vmax": 1.0,
+  "span": 267.9,
+  "w": 640,
+  "h": 480,
+  "bg_valid": false,
+  "bg_count": 0,
+  "cam_auto": 0,
+  "cam_aec": 1200,
+  "cam_gain": 2,
+  "ca": 1.01321,
+  "cb": -0.00397
+ },
+ "args": {
+  "port": "COM4",
+  "xiao": "http://192.168.11.5",
+  "mode": "grid",
+  "step": 0.05,
+  "count": 50,
+  "n": 3,
+  "settle": 0.5,
+  "err_th": 0.01,
+  "save_all": true,
+  "tag": "hood1_nobg",
+  "no_bg": true
+ },
+ "bg_used": false
+}

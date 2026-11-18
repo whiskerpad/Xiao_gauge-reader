@@ -1,0 +1,15 @@
+# Wi-Fi 接続情報(公開しない)
+02_xiao_reader/include/secrets.h
+# ビルド生成物・一時ファイル
+.pio/
+**/.pio/
+__pycache__/
+*.pyc
+_tmp/
+.vscode/
+# サーバーの実行時データ
+04_pi_server/*.db
+04_pi_server/*.sqlite*
+04_pi_server/data/
+# 測定画像(CSV・集計のみ公開)
+dataset/**/images/

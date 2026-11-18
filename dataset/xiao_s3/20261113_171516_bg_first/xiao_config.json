@@ -1,0 +1,29 @@
+{
+ "config": {
+  "cx": 312.0,
+  "cy": 236.0,
+  "ri": 80.0,
+  "ro": 127.4,
+  "a0": 225.7,
+  "a1": 130.5,
+  "vmin": 0.0,
+  "vmax": 1.0,
+  "span": 264.8,
+  "w": 640,
+  "h": 480,
+  "bg_valid": true,
+  "bg_count": 42
+ },
+ "args": {
+  "port": "COM4",
+  "xiao": "http://192.168.11.5",
+  "mode": "grid",
+  "step": 0.05,
+  "count": 50,
+  "n": 3,
+  "settle": 0.5,
+  "err_th": 0.01,
+  "save_all": false,
+  "tag": "bg_first"
+ }
+}

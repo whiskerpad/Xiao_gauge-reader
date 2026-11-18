@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>圧力計トレンド</title>
+<script src="/static/chart.umd.js"></script><!-- Chart.js 4.4.1 (MIT) をローカルに置き、インターネット無しでも表示 -->
+<style>
+  :root { --bg:#fafafa; --fg:#222; --sub:#666; --card:#fff; --line:#ddd; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181c; --fg:#e8e8e8; --sub:#9aa; --card:#1f2228; --line:#333; } }
+  body { margin:0; font-family: system-ui, "Segoe UI", "Hiragino Sans", "Meiryo", sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 16px; display:flex; flex-wrap:wrap; align-items:baseline; gap:12px; }
+  h1 { font-size:18px; margin:0; }
+  .now { font-size:32px; font-weight:700; font-variant-numeric: tabular-nums; }
+  .now small { font-size:14px; color:var(--sub); font-weight:400; }
+  .bar { padding:0 16px 8px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  button { padding:4px 10px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; cursor:pointer; }
+  button.on { background:#2b6cb0; color:#fff; border-color:#2b6cb0; }
+  .wrap { margin:0 16px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px; height:60vh; min-height:320px; }
+  .stats { padding:10px 16px; display:grid; grid-template-columns: repeat(auto-fill, minmax(150px,1fr)); gap:8px; }
+  .s { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .s b { display:block; font-size:18px; font-variant-numeric: tabular-nums; }
+  .s span { color:var(--sub); font-size:12px; }
+  .ng { color:#d33; }
+  a { color:#4a90d9; }
+</style>
+</head>
+<body>
+<header>
+  <h1>圧力計トレンド</h1>
+  <div class="now" id="now">-- <small>MPa</small></div>
+  <div id="nowsub" style="color:var(--sub)"></div>
+</header>
+<div class="bar">
+  表示範囲:
+  <button data-m="10">10分</button><button data-m="30" class="on">30分</button><button data-m="60">1時間</button>
+  <button data-m="360">6時間</button><button data-m="1440">24時間</button>
+  <label style="margin-left:8px"><input type="checkbox" id="auto" checked> 自動更新(5秒)</label>
+  <label><input type="checkbox" id="full"> 縦軸 0〜1.0 固定</label>
+  <a id="csv" href="#" style="margin-left:auto">CSVダウンロード</a>
+</div>
+<div class="wrap"><canvas id="cv"></canvas></div>
+<div class="stats">
+  <div class="s"><span>読み取り回数</span><b id="s_n">-</b></div>
+  <div class="s"><span>値あり</span><b id="s_ok">-</b></div>
+  <div class="s"><span>未取得</span><b id="s_ng" class="ng">-</b></div>
+  <div class="s"><span>未取得率</span><b id="s_rate">-</b></div>
+  <div class="s"><span>指令値との平均絶対誤差</span><b id="s_mae">-</b></div>
+  <div class="s"><span>指令値との最大誤差</span><b id="s_max">-</b></div>
+  <div class="s"><span>±2%FS以内</span><b id="s_w2">-</b></div>
+</div>
+<script>
+let minutes = 30, timer = null;
+const $ = id => document.getElementById(id);
+const fmtT = t => { const d = new Date(t * 1000); return d.toLocaleTimeString('ja-JP', {hour12:false}); };
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+const chart = new Chart($('cv'), {
+  type: 'line',
+  data: { datasets: [
+    { label: '読み取り値', data: [], borderColor: '#2b6cb0', backgroundColor: '#2b6cb0', pointRadius: 2, borderWidth: 1.5, spanGaps: false, order: 1 },
+    { label: '指令値(疑似針)', data: [], borderColor: '#999', borderDash: [5,4], pointRadius: 0, borderWidth: 1, stepped: 'before', order: 3 },
+    { label: '未取得', data: [], type: 'scatter', borderColor: '#d33', backgroundColor: '#d33', pointRadius: 4, pointStyle: 'circle', order: 0 },
+  ]},
+  options: {
+    animation: false, maintainAspectRatio: false, parsing: false, normalized: true,
+    interaction: { mode: 'nearest', intersect: false },
+    scales: {
+      x: { type: 'linear', ticks: { callback: v => fmtT(v), maxTicksLimit: 8, color: css('--sub') }, grid: { color: css('--line') } },
+      y: { title: { display: true, text: 'MPa', color: css('--sub') }, ticks: { color: css('--sub') }, grid: { color: css('--line') } },
+    },
+    plugins: {
+      legend: { labels: { color: css('--fg') } },
+      tooltip: { callbacks: {
+        title: items => items.length ? fmtT(items[0].parsed.x) : '',
+        label: it => it.dataset.label === '未取得' ? '未取得' : `${it.dataset.label}: ${it.parsed.y.toFixed(3)} MPa`,
+      } },
+    },
+  },
+});
+
+async function refresh() {
+  let d;
+  try { d = await (await fetch(`/api/data?minutes=${minutes}`)).json(); } catch (e) { $('nowsub').textContent = 'サーバーに接続できません'; return; }
+  // 値ありの線: 未取得の時刻で線を切る
+  const pts = [];
+  const all = d.ok.map(p => ({x: p[0], y: p[1]})).concat(d.ng.map(p => ({x: p[0], y: null})));
+  all.sort((a, b) => a.x - b.x);
+  for (const p of all) pts.push(p);
+  const ys = d.ok.map(p => p[1]).concat(d.truth.map(p => p[1]));
+  let lo = 0, hi = 1.0;
+  if (!$('full').checked && ys.length) {
+    lo = Math.min(...ys); hi = Math.max(...ys);
+    const pad = Math.max(0.02, (hi - lo) * 0.08); lo -= pad; hi += pad;
+  }
+  // 未取得は縦軸の下端付近に赤い点で表示
+  const ngY = lo + (hi - lo) * 0.03;
+  chart.data.datasets[0].data = pts;
+  const tr = d.truth.map(p => ({x: Math.max(p[0], d.t0), y: p[1]}));
+  if (tr.length) tr.push({x: d.t1, y: tr[tr.length - 1].y});
+  chart.data.datasets[1].data = tr;
+  chart.data.datasets[2].data = d.ng.map(p => ({x: p[0], y: ngY}));
+  chart.options.scales.x.min = d.t0; chart.options.scales.x.max = d.t1;
+  chart.options.scales.y.min = lo; chart.options.scales.y.max = hi;
+  chart.update();
+
+  const s = d.stats, L = s.last;
+  if (L) {
+    $('now').innerHTML = (L.ok ? L.value.toFixed(3) : '<span class="ng">未取得</span>') + ' <small>MPa</small>';
+    $('nowsub').textContent = `最終受信 ${fmtT(L.ts)}  (seq ${L.seq ?? '-'}, ${L.ms ?? '-'} ms)`;
+  }
+  $('s_n').textContent = s.n; $('s_ok').textContent = s.ok; $('s_ng').textContent = s.ng;
+  $('s_rate').textContent = s.ng_rate == null ? '-' : (s.ng_rate * 100).toFixed(1) + '%';
+  $('s_mae').textContent = s.mae == null ? '-' : (s.mae * 100).toFixed(2) + '%FS';
+  $('s_max').textContent = s.max_err == null ? '-' : (s.max_err * 100).toFixed(2) + '%FS';
+  $('s_w2').textContent = s.within2 == null ? '-' : (s.within2 * 100).toFixed(1) + '%';
+  $('csv').href = `/api/export.csv?minutes=${minutes}`;
+}
+
+document.querySelectorAll('button[data-m]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('button[data-m]').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); minutes = +b.dataset.m; refresh();
+});
+$('full').onchange = refresh;
+function setTimer() { clearInterval(timer); if ($('auto').checked) timer = setInterval(refresh, 5000); }
+$('auto').onchange = setTimer;
+refresh(); setTimer();
+</script>
+</body>
+</html>
