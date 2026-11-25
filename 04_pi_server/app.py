@@ -178,13 +178,13 @@ def my_ip_toward(host):
         s.close()
 
 
-def setup_xiao(xiao, interval, n, port):
+def setup_xiao(xiao, interval, n, port, nn=None):
     import requests
     host = urlparse(xiao).hostname
     ip = my_ip_toward(socket.gethostbyname(host))
     url = f"http://{ip}:{port}/api/reading"
     r = requests.get(f"{xiao.rstrip('/')}/log/set",
-                     params={"on": 1, "intv": interval, "n": n, "url": url}, timeout=10)
+                     params={"on": 1, "intv": interval, "n": n, "url": url, **({} if nn is None else {"nn": nn})}, timeout=10)
     print(f"XIAO 定期読み取り設定: {r.text}")
     return ip
 
@@ -195,12 +195,17 @@ def main():
     ap.add_argument("--xiao", default="", help="例: http://192.168.11.5 (指定すると起動時に送信先を設定)")
     ap.add_argument("--interval", type=int, default=5, help="XIAO の読み取り間隔[秒]")
     ap.add_argument("--n", type=int, default=3, help="1回の読み取り枚数(中央値)")
+    ap.add_argument("--nn", type=int, choices=[0, 1], default=None, help="1: 機械学習(極座標CNN)で読む、0: 画像処理(リング方式)で読む。省略時はXIAOの設定のまま")
+    ap.add_argument("--db", default=None, help="SQLiteファイル(省略時 data/gauge.db)。方式ごとに分けると比較しやすい")
     args = ap.parse_args()
+    if args.db:
+        global DB_PATH
+        DB_PATH = os.path.abspath(args.db)
     init_db()
     ip = "127.0.0.1"
     if args.xiao:
         try:
-            ip = setup_xiao(args.xiao, args.interval, args.n, args.port)
+            ip = setup_xiao(args.xiao, args.interval, args.n, args.port, args.nn)
         except Exception as e:
             print(f"XIAO の設定に失敗: {e}  (ブラウザで /log/set を開いて手動設定も可)")
     print(f"トレンド表示: http://{ip}:{args.port}/   (このPC: http://127.0.0.1:{args.port}/)")

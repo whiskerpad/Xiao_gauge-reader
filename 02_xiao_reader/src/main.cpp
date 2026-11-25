@@ -27,6 +27,9 @@
 //   リング方式(マーカーモード時): /config/set?rgon=1&rg0=18&rg1=38&rgq=0.3
 //   置針の除外: /config/set?fpon=1&fpv=0.80&fpw=3
 //   視差補正: /config/set?nd=8&camf=460(nd=針の奥行き[mm]、0=補正なし)
+//   GET /hom          射影変換の補正の状態(JSON)。/hom?m=m0,...,m8 で設定(NVSへ保存)、/hom?clear=1 で解除
+//                     m は 学習時の見え方の座標 → 今の画像の座標 の3x3行列。05_ml/hom_check.py --upload が送る
+//                     設定中は /nn の前に画像を学習時の見え方に変換する(カメラ位置が学習時と違っても読める)
 //   GET /log          定期読み取りの状態(JSON)
 //   GET /log/set?on=1&intv=5&n=3&url=http://<サーバー>:5000/api/reading
 //                     定期読み取り: intv秒ごとにn枚読み取り、結果JSONを url へPOST(NVSへ保存、再起動後も継続)
@@ -47,6 +50,7 @@
 #define MK_ALLOC(n) ps_malloc(n)   // マーカー自動探索の作業領域はPSRAMに取る
 #include "gauge.h"
 #include "webpage.h"
+#include "nn_polar.h"   // 機械学習(極座標CNN)での読み取り。重み・基準は nn_polar_data.h(05_ml で生成)
 
 static const framesize_t FRAME_SIZE = FRAMESIZE_VGA;  // 640x480 グレースケール
 static const int  JPEG_QUALITY = 80;                  // fmt2jpg の品質(0-100)
@@ -71,8 +75,12 @@ int         frameW = 0, frameH = 0;
 // ---- 定期読み取り・送信(2026-11-16) ----
 //   lgOn=1 のとき、lgIntv 秒ごとに lgN 枚を読み取り(/read と同じ処理)、結果のJSONを srvUrl へ POST する。
 //   送信先(Flaskサーバー)が止まっていても読み取りは続ける(結果は /log で確認できる)。
-struct LogSet { int on = 0; int intv = 5; int n = 3; String url = ""; };
+struct LogSet { int on = 0; int intv = 5; int n = 3; String url = ""; int nn = 0; };   // nn=1: 定期読み取りをCNNで行う
 LogSet lg;
+bool homOn = false;                         // 射影変換の補正を使う(/hom、NVS: homm)
+float homM[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; // 学習時の見え方の座標 → 今の画像の座標
+uint8_t* homBuf = nullptr;                  // 変換後の画像(PSRAM、640x480)
+float nnConfMin = 0.8f;   // CNN: 1枚の「自信」がこれ未満なら使わない(知らない照明など)。/nn?cf=0.7&save=1 で変更(NVS: nncf)
 uint32_t lgSeq = 0, lgSent = 0, lgFail = 0, lgOkN = 0, lgNgN = 0;
 int      lgLastCode = 0;
 String   lgLastJson = "{}";
@@ -272,6 +280,9 @@ void loadConfig() {
   lg.intv = prefs.getInt("lgi", 5);
   lg.n    = prefs.getInt("lgn", 3);
   lg.url  = prefs.getString("lgu", "");
+  lg.nn   = prefs.getInt("lgnn", 0);
+  nnConfMin = prefs.getFloat("nncf", 0.8f);
+  homOn = prefs.isKey("homm") && prefs.getBytes("homm", homM, sizeof(homM)) == sizeof(homM);
   prefs.end();
 }
 
@@ -415,14 +426,129 @@ void handleRead() {
   server.send(200, "application/json", js);
 }
 
+// ---- 機械学習(極座標CNN)での読み取り ----
+PolarWork* polW = nullptr;                  // 作業領域(PSRAM、約2.7MB)
+int polSinceFull = 0;                       // 位置合わせの全探索からの読み取り回数(30回ごとに全探索)
+static const float NN_SPREAD_MAX = 0.03f;   // n枚の推定値の幅がこれを超えたら未取得(手・影などで不安定)
+static const float NN_MOVE_STEP = 0.15f;    // 「針が動いている」とみなす1枚ごとの変化の上限(これより大きい飛びは不安定とみなす)
+static const float NN_MOVE_BACK = 0.01f;    // 同じ向きの判定で許す逆向きの揺れ
+static void* psAlloc(size_t n) { void* p = ps_malloc(n); return p ? p : malloc(n); }
+
+// n 枚撮って 位置合わせ→極座標→CNN で推定し、自信が cf 以上の画像の中央値を返す
+// 幅が NN_SPREAD_MAX を超えても、自信のある画像が2枚以上・撮った順に同じ向きへ少しずつ変わっていれば
+// 「針が動いている」とみなし、最後の1枚の値を返す(mv=1)。allowMove=false で無効
+String doNn(int n, bool& okOut, float cf = -1, bool allowMove = true) {
+  if (cf <= 0) cf = nnConfMin;
+  n = constrain(n, 1, READ_MAX_N);
+  float vals[READ_MAX_N]; float seqv[READ_MAX_N]; int okN = 0, rejN = 0; uint32_t usMax = 0; float cMin = 1;
+  int dxL = 0, dyL = 0; float nccL = 0;
+  String fv = "[";   // 各画像の [値, 自信, dx, dy](閾値をPCで後から検討するため)
+  uint32_t t0 = millis();
+  if (!polW) { polW = new PolarWork(); if (!polarInit(*polW, psAlloc)) { delete polW; polW = nullptr; } }
+  bool full = polW && (!polW->haveShift || polSinceFull >= 30);   // 普段は前回の位置の近くだけ探す(速い)
+  if (full) polSinceFull = 0; else polSinceFull++;
+  bool fullUsed = full;
+  for (int i = 0; i < n && polW; i++) {
+    camera_fb_t* fb = grabFresh();
+    if (!fb) continue;
+    uint32_t u = micros();
+    const uint8_t* src = fb->buf;
+    if (homOn) {
+      if (!homBuf) homBuf = (uint8_t*)psAlloc((size_t)fb->width * fb->height);
+      if (homBuf) { polarWarp(fb->buf, fb->width, fb->height, homM, homBuf); src = homBuf; }
+    }
+    PolarResult r = polarRead(*polW, src, fb->width, fb->height, full && i == 0);
+    u = micros() - u; if (u > usMax) usMax = u;
+    memcpy(lastFrame, fb->buf, (size_t)frameW * frameH);
+    esp_camera_fb_return(fb);
+    if (fv.length() > 1) fv += ",";
+    fv += "["; fv += String(r.value, 4); fv += ","; fv += String(r.conf, 3); fv += ","; fv += r.dx; fv += ","; fv += r.dy; fv += "]";
+    dxL = r.dx; dyL = r.dy; nccL = r.ncc;
+    if (isnan(r.value)) continue;
+    if (r.conf < cMin) cMin = r.conf;
+    if (r.conf < cf) { rejN++; continue; }    // 自信が低い → 使わない
+    seqv[okN] = r.value;                       // 撮った順
+    vals[okN++] = r.value;
+  }
+  char b[420];
+  float v = 0, lo = 0, hi = 0;
+  if (okN > 0) { std::sort(vals, vals + okN); v = vals[okN / 2]; lo = vals[0]; hi = vals[okN - 1]; }
+  bool mv = false;
+  if (allowMove && okN >= 2 && (hi - lo) > NN_SPREAD_MAX) {
+    bool up = true, down = true, small = true;
+    for (int i = 1; i < okN; i++) {
+      float d = seqv[i] - seqv[i - 1];
+      if (d < -NN_MOVE_BACK) up = false;
+      if (d > NN_MOVE_BACK) down = false;
+      if (fabsf(d) > NN_MOVE_STEP) small = false;
+    }
+    float tot = seqv[okN - 1] - seqv[0];
+    if (small && ((up && tot > 0) || (down && tot < 0))) { mv = true; v = seqv[okN - 1]; }
+  }
+  bool ok = okN > 0 && ((hi - lo) <= NN_SPREAD_MAX || mv) && v > -0.05f && v < 1.05f;
+  okOut = ok;
+  if (ok) v = constrain(v, 0.0f, 1.0f);
+  snprintf(b, sizeof(b),
+    "{\"ok\":%s,\"nn\":2,\"mv\":%d,\"value\":%.4f,\"raw\":%.4f,\"v_lo\":%.4f,\"v_hi\":%.4f,\"conf_min\":%.3f,\"cf\":%.2f,\"rej\":%d,\"n\":%d,\"okn\":%d,"
+    "\"dx\":%d,\"dy\":%d,\"ncc\":%.3f,\"full\":%d,\"hom\":%d,\"infer_us\":%lu,\"ms\":%lu,\"fv\":",
+    ok ? "true" : "false", mv ? 1 : 0, v, okN ? vals[okN / 2] : 0.0f, lo, hi, cMin, cf, rejN, n, okN, dxL, dyL, nccL, fullUsed ? 1 : 0, homOn ? 1 : 0, (unsigned long)usMax, (unsigned long)(millis() - t0));
+  String js(b);
+  js += fv; js += "]}";
+  return js;
+}
+
+// /nn?n=3&cf=0.8  (cf: 自信の下限。&save=1 で保存し定期読み取りにも使う。mv=0: 動いている判定を使わない)
+void handleNn() {
+  uiTouch();
+  int n  = server.hasArg("n")  ? server.arg("n").toInt()  : 3;
+  float cf = server.hasArg("cf") ? server.arg("cf").toFloat() : -1;
+  if (cf > 0 && server.hasArg("save")) {
+    nnConfMin = constrain(cf, 0.0f, 1.0f);
+    prefs.begin("gauge", false); prefs.putFloat("nncf", nnConfMin); prefs.end();
+  }
+  bool mvOn = !server.hasArg("mv") || server.arg("mv").toInt() != 0;   // /nn?mv=0 で「動いている」判定なし
+  bool ok;
+  String js = doNn(n, ok, cf, mvOn);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", js);
+}
+
+// /hom: 射影変換の補正。?m=m0,...,m8 で設定、?clear=1 で解除、引数なしで状態
+String homJson() {
+  String js = "{\"on\":"; js += homOn ? "true" : "false"; js += ",\"m\":[";
+  for (int i = 0; i < 9; i++) { if (i) js += ","; js += String(homM[i], 8); }
+  js += "]}"; return js;
+}
+void handleHom() {
+  uiTouch();
+  if (server.hasArg("clear")) {
+    homOn = false;
+    prefs.begin("gauge", false); prefs.remove("homm"); prefs.end();
+    if (polW) polW->haveShift = false;
+  } else if (server.hasArg("m")) {
+    String a = server.arg("m"); float m[9]; int k = 0, p = 0;
+    while (k < 9 && p <= (int)a.length()) {
+      int q = a.indexOf(',', p); if (q < 0) q = a.length();
+      m[k++] = a.substring(p, q).toFloat(); p = q + 1;
+    }
+    if (k != 9 || fabsf(m[8]) < 1e-9f) { server.send(400, "application/json", "{\"error\":\"m needs 9 numbers\"}"); return; }
+    for (int i = 0; i < 9; i++) homM[i] = m[i];
+    homOn = true;
+    prefs.begin("gauge", false); prefs.putBytes("homm", homM, sizeof(homM)); prefs.end();
+    if (polW) polW->haveShift = false;            // 次の読み取りで位置合わせを全探索し直す
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", homJson());
+}
+
 // 定期読み取り1回分: 読み取り → 通し番号等を付けて POST
 void logOnce() {
   bool ok;
-  String js = doRead(lg.n, ok);
+  String js = lg.nn ? doNn(lg.n, ok) : doRead(lg.n, ok);
   lgSeq++;
   if (ok) lgOkN++; else lgNgN++;
   // マーカーが続けて見つからない(カメラが動いた等)→ 20秒に1回まで自動探索
-  if (cfg.mk && lastRes.mkUsed && !lastRes.mkOk) mkFailRun++; else mkFailRun = 0;
+  if (!lg.nn && cfg.mk && lastRes.mkUsed && !lastRes.mkOk) mkFailRun++; else mkFailRun = 0;   // CNN読み取り中はマーカーを見ない
   if (mkFailRun >= 3 && millis() - mkFindAt > 20000UL) { if (markerAutoFindNow()) mkFailRun = 0; }   // 20秒に1回まで
   js.remove(js.length() - 1);
   js += ",\"seq\":"; js += String(lgSeq);
@@ -445,6 +571,7 @@ String logJson() {
   s += ",\"intv\":"; s += lg.intv;
   s += ",\"paused_s\":"; s += uiActive() ? (int)((UI_PAUSE_MS - (millis() - lastUiMs)) / 1000) : 0;
   s += ",\"n\":"; s += lg.n;
+  s += ",\"nn\":"; s += lg.nn;
   s += ",\"url\":\""; s += lg.url; s += "\"";
   s += ",\"seq\":"; s += lgSeq;
   s += ",\"ok\":"; s += lgOkN;
@@ -468,7 +595,9 @@ void handleLogSet() {
   if (server.hasArg("intv")) lg.intv = constrain(server.arg("intv").toInt(), 2, 3600);
   if (server.hasArg("n"))    lg.n = constrain(server.arg("n").toInt(), 1, READ_MAX_N);
   if (server.hasArg("url"))  lg.url = server.arg("url");
+  if (server.hasArg("nn"))   lg.nn = server.arg("nn").toInt() ? 1 : 0;
   prefs.begin("gauge", false);
+  prefs.putInt("lgnn", lg.nn);
   prefs.putInt("lgon", lg.on); prefs.putInt("lgi", lg.intv); prefs.putInt("lgn", lg.n); prefs.putString("lgu", lg.url);
   prefs.end();
   handleLog();
@@ -778,6 +907,8 @@ void setup() {
   server.on("/mk/find",     handleMkFind);
   server.on("/log",         handleLog);
   server.on("/log/set",     handleLogSet);
+  server.on("/nn",          handleNn);
+  server.on("/hom",         handleHom);
   server.begin();
 
   // 起動時: 保存済みの位置でマーカーが見つからなければ、画像全体から自動探索する

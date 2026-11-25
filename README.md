@@ -1,6 +1,7 @@
 # gauge-reader  アナログ圧力計 読み取りプロジェクト
 
 > 経緯・判断・現状・既知の課題は [docs/DEVLOG.md](docs/DEVLOG.md) を参照(AIへの引き継ぎ用メモあり)
+> 各コードの用途と使い方は [docs/GUIDE.md](docs/GUIDE.md)、カメラを付け直したときの補正は [docs/ALIGNMENT.md](docs/ALIGNMENT.md)
 
 疑似メーター(実ゲージの文字盤+28BYJ-48駆動の指針)を自動で動かし、
 角度ラベル付き画像を自動収集して、直読み → 各マイコン比較 → 機械学習 まで進める。
@@ -11,7 +12,11 @@
 | 01_stepper_needle | 指針駆動スケッチ(UNO)+ Python制御クラス・試験ツール | 作成済み |
 | 02_xiao_reader    | XIAO ESP32S3 Sense 単体読み取りファーム(PlatformIO) | 作成済み |
 | 03_pc_runner      | PC統括・精度評価スクリプト | 作成済み |
-| 04_pi_server      | ラズパイ収集サーバー+Flask確認画面(最終段階で使用) | 後回し |
+| 04_pi_server      | 読み取り値の受信サーバー+トレンドグラフ(Flask、PCで動作確認) | 作成済み |
+| 05_ml             | 機械学習(画像の自動収集、極座標CNNの学習とXIAO用ヘッダ、カメラ位置の補正) | 作成済み |
+| 06_phone_reader   | iPhone の Safari で読む(PCで推論) | 作成済み |
+| 07_dial_auto      | 学習なしで読む試作(目盛り+OCR+針の角度) | 試作 |
+| _old              | 使わなくなったコード・旧モデル(GitHubに上げない) | - |
 | dataset           | 収集画像とラベル(CSV) | - |
 | docs              | ブログ用メモ・配線図・検証記録 | - |
 
@@ -71,6 +76,8 @@
 |---|---|
 | `/` | 設定画面(ボタン選択→画像クリックで中心・内半径・外半径・0目盛り・最大目盛りを設定→保存) |
 | `/read?n=3` | n枚解析し中央値をJSONで返す(value, angle, width, contrast, analyze_us 等) |
+| `/nn?n=3` | 機械学習(極座標CNN)で n枚読み、JSONで返す(value, conf, ok, ncc, dx, dy, hom 等) |
+| `/hom` | カメラ位置の補正(射影変換)の状態。`?m=…` で設定・`?clear=1` で解除(docs/ALIGNMENT.md) |
 | `/capture.jpg` | 最新フレーム |
 | `/last.jpg` | 直近の /read で解析したフレーム |
 | `/config` `/config/set?...` | 設定の取得・変更(NVSに保存、再起動後も保持) |

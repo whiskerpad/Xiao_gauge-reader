@@ -13,3 +13,16 @@ _tmp/
 04_pi_server/data/
 # 測定画像(CSV・集計のみ公開)
 dataset/**/images/
+# 機械学習の収集データ(画像)
+05_ml/data/
+05_ml/results/*/images/
+05_ml/*.npz
+05_ml/*_res.npy
+*.bak
+06_phone_reader/results/
+# 使わなくなったコード・旧モデル(参照用に保管)
+_old/
+# 画像をまとめた圧縮ファイル・確認用のスクリーンショット(公開しない)
+05_ml/results/*.zip
+05_ml/results/*.png
+iPhone/
